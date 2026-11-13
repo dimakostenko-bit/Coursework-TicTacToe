@@ -1,0 +1,1124 @@
+RUSTSHELL — ПОВНИЙ ЛІСТИНГ ВИХІДНОГО КОДУ
+Кожен фрагмент нижче відповідає окремому файлу проєкту.
+
+==============================================================================
+ФАЙЛ: Cargo.toml
+==============================================================================
+[package]
+name = "rustshell"
+version = "0.3.0"
+edition = "2021"
+rust-version = "1.65"
+description = "Cross-platform educational shell with pipelines, history and logging"
+license = "MIT"
+
+[dependencies]
+
+==============================================================================
+ФАЙЛ: src/bin/pipeline_fixture.rs
+==============================================================================
+//! Допоміжний виконуваний файл для інтеграційного тестування конвеєрів.
+//! Не є частиною інтерактивної оболонки та використовується лише тестами.
+
+use std::io::{self, Read, Write};
+use std::process;
+
+fn main() {
+    let mut args = std::env::args().skip(1);
+    let operation = args.next().unwrap_or_default();
+
+    let result = match operation.as_str() {
+        "emit" => {
+            let values: Vec<String> = args.collect();
+            println!("{}", values.join(" "));
+            Ok(())
+        }
+        "emit-lines" => {
+            for value in args {
+                println!("{value}");
+            }
+            Ok(())
+        }
+        "emit-many" => match args.next().and_then(|value| value.parse::<usize>().ok()) {
+            Some(count) => {
+                let stdout = io::stdout();
+                let mut output = io::BufWriter::new(stdout.lock());
+                for index in 0..count {
+                    if writeln!(output, "{index}").is_err() {
+                        return;
+                    }
+                }
+                output.flush().map_err(|error| error.to_string())
+            }
+            None => Err("emit-many очікує ціле невід'ємне число".to_string()),
+        },
+        "upper" => {
+            let mut input = String::new();
+            io::stdin()
+                .read_to_string(&mut input)
+                .map_err(|error| error.to_string())
+                .and_then(|_| {
+                    print!("{}", input.to_uppercase());
+                    io::stdout().flush().map_err(|error| error.to_string())
+                })
+        }
+        "filter" => {
+            let needle = args.next().unwrap_or_default();
+            let mut input = String::new();
+            io::stdin()
+                .read_to_string(&mut input)
+                .map_err(|error| error.to_string())
+                .and_then(|_| {
+                    let stdout = io::stdout();
+                    let mut output = io::BufWriter::new(stdout.lock());
+                    for line in input.lines() {
+                        if line.contains(&needle) {
+                            writeln!(output, "{line}").map_err(|error| error.to_string())?;
+                        }
+                    }
+                    output.flush().map_err(|error| error.to_string())
+                })
+        }
+        "count" => {
+            let mut input = String::new();
+            io::stdin()
+                .read_to_string(&mut input)
+                .map_err(|error| error.to_string())
+                .map(|_| println!("{}", input.lines().count()))
+        }
+        "exit" => {
+            let code = args
+                .next()
+                .and_then(|value| value.parse::<i32>().ok())
+                .unwrap_or(0);
+            process::exit(code);
+        }
+        _ => Err(format!("невідома тестова операція: {operation}")),
+    };
+
+    if let Err(error) = result {
+        eprintln!("pipeline_fixture: {error}");
+        process::exit(2);
+    }
+}
+
+==============================================================================
+ФАЙЛ: src/builtins.rs
+==============================================================================
+use std::env;
+use std::path::PathBuf;
+#[cfg(windows)]
+use std::process::Command;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Builtin {
+    Help,
+    Cd(Option<PathBuf>),
+    Pwd,
+    History,
+    Clear,
+    Exit,
+}
+
+/// Розпізнає вбудовані команди та перевіряє кількість їхніх аргументів.
+pub fn classify(program: &str, args: &[String]) -> Result<Option<Builtin>, String> {
+    let builtin = match program {
+        "help" => {
+            require_no_args(program, args)?;
+            Some(Builtin::Help)
+        }
+        "pwd" => {
+            require_no_args(program, args)?;
+            Some(Builtin::Pwd)
+        }
+        "history" => {
+            require_no_args(program, args)?;
+            Some(Builtin::History)
+        }
+        "clear" => {
+            require_no_args(program, args)?;
+            Some(Builtin::Clear)
+        }
+        "exit" | "quit" => {
+            require_no_args(program, args)?;
+            Some(Builtin::Exit)
+        }
+        "cd" => {
+            if args.len() > 1 {
+                return Err("використання: cd [каталог]".into());
+            }
+            let target = match args.first().map(String::as_str) {
+                Some("~") | None => Some(
+                    home_dir().ok_or("не вдалося визначити домашній каталог")?,
+                ),
+                Some(path) => Some(PathBuf::from(path)),
+            };
+            Some(Builtin::Cd(target))
+        }
+        _ => None,
+    };
+    Ok(builtin)
+}
+
+fn require_no_args(name: &str, args: &[String]) -> Result<(), String> {
+    if args.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("команда {name} не приймає аргументів"))
+    }
+}
+
+pub fn home_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        env::var_os("USERPROFILE").map(PathBuf::from)
+    }
+    #[cfg(not(windows))]
+    {
+        env::var_os("HOME").map(PathBuf::from)
+    }
+}
+
+/// Очищує екран термінала стандартним для платформи способом.
+pub fn clear_screen() {
+    #[cfg(windows)]
+    {
+        let _ = Command::new("cmd").args(["/C", "cls"]).status();
+    }
+    #[cfg(not(windows))]
+    {
+        print!("\x1B[2J\x1B[H");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{classify, Builtin};
+
+    #[test]
+    fn recognizes_basic_builtins() {
+        let empty: Vec<String> = Vec::new();
+        assert_eq!(classify("help", &empty).unwrap(), Some(Builtin::Help));
+        assert_eq!(classify("pwd", &empty).unwrap(), Some(Builtin::Pwd));
+        assert_eq!(classify("history", &empty).unwrap(), Some(Builtin::History));
+        assert_eq!(classify("exit", &empty).unwrap(), Some(Builtin::Exit));
+    }
+
+    #[test]
+    fn rejects_unexpected_arguments_for_no_argument_builtins() {
+        assert!(classify("pwd", &["extra".to_string()]).is_err());
+        assert!(classify("help", &["extra".to_string()]).is_err());
+    }
+
+    #[test]
+    fn cd_accepts_a_path_and_rejects_multiple_paths() {
+        assert!(matches!(
+            classify("cd", &["folder name".to_string()]).unwrap(),
+            Some(Builtin::Cd(Some(_)))
+        ));
+        assert!(classify("cd", &["one".to_string(), "two".to_string()]).is_err());
+    }
+
+    #[test]
+    fn unknown_command_is_not_a_builtin() {
+        assert_eq!(classify("git", &[]).unwrap(), None);
+    }
+}
+
+==============================================================================
+ФАЙЛ: src/history.rs
+==============================================================================
+#[derive(Default, Debug)]
+pub struct History {
+    entries: Vec<String>,
+}
+
+impl History {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn push(&mut self, line: impl Into<String>) {
+        self.entries.push(line.into());
+    }
+
+    pub fn entries(&self) -> &[String] {
+        &self.entries
+    }
+
+    pub fn print(&self) {
+        for (index, item) in self.entries.iter().enumerate() {
+            println!("{:>4}  {}", index + 1, item);
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::History;
+
+    #[test]
+    fn stores_entries_in_insertion_order() {
+        let mut history = History::new();
+        history.push("pwd");
+        history.push("ls -la");
+        assert_eq!(
+            history.entries(),
+            &[String::from("pwd"), String::from("ls -la")]
+        );
+        assert_eq!(history.len(), 2);
+        assert!(!history.is_empty());
+    }
+
+    #[test]
+    fn new_history_is_empty() {
+        let history = History::new();
+        assert!(history.is_empty());
+        assert_eq!(history.len(), 0);
+    }
+}
+
+==============================================================================
+ФАЙЛ: src/lib.rs
+==============================================================================
+pub mod builtins;
+pub mod history;
+pub mod logger;
+pub mod parser;
+pub mod pipeline;
+pub mod shell;
+
+==============================================================================
+ФАЙЛ: src/logger.rs
+==============================================================================
+use std::fs::OpenOptions;
+use std::io::{self, Write};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Простий append-only журнал команд оболонки.
+pub struct Logger {
+    path: String,
+}
+
+impl Logger {
+    pub fn new(path: impl Into<String>) -> Self {
+        Self { path: path.into() }
+    }
+
+    /// Додає один запис. Керівні символи команди екрануються,
+    /// щоб команда не могла створити додаткові рядки журналу.
+    pub fn record(&self, command: &str, status: &str) -> io::Result<()> {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
+
+        let safe = command
+            .replace('\\', "\\\\")
+            .replace('\t', "\\t")
+            .replace('\n', "\\n")
+            .replace('\r', "\\r");
+
+        writeln!(file, "{timestamp}\t{status}\t{safe}")
+    }
+
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Logger;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temporary_log_path() -> String {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir()
+            .join(format!("rustshell-log-{}-{nonce}.log", std::process::id()))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    #[test]
+    fn appends_records_to_log() {
+        let path = temporary_log_path();
+        let logger = Logger::new(&path);
+        logger.record("echo first", "START").unwrap();
+        logger.record("echo second", "EXIT_0").unwrap();
+
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(content.contains("START\techo first"));
+        assert!(content.contains("EXIT_0\techo second"));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn escapes_control_characters_in_command() {
+        let path = temporary_log_path();
+        let logger = Logger::new(&path);
+        logger.record("echo a\tb\nc", "START").unwrap();
+
+        let content = fs::read_to_string(&path).unwrap();
+        assert_eq!(content.lines().count(), 1);
+        assert!(content.contains(r"echo a\tb\nc"));
+        fs::remove_file(path).unwrap();
+    }
+}
+
+==============================================================================
+ФАЙЛ: src/main.rs
+==============================================================================
+use rustshell::shell::Shell;
+use std::io::{self, Write};
+
+fn main() {
+    let mut shell = Shell::new();
+    println!("RustShell 0.3.0 — кросплатформна навчальна оболонка");
+    println!("Введіть help для довідки. Команда exit завершує роботу.");
+
+    loop {
+        print!("{}> ", shell.prompt());
+        if let Err(error) = io::stdout().flush() {
+            eprintln!("Помилка виведення запрошення: {error}");
+            break;
+        }
+
+        let mut line = String::new();
+        match io::stdin().read_line(&mut line) {
+            Ok(0) => {
+                println!();
+                break;
+            }
+            Ok(_) => {
+                let line = line.trim_end_matches(&['\r', '\n'][..]);
+                if line.trim().is_empty() { continue; }
+                match shell.execute_line(line) {
+                    Ok(true) => {}
+                    Ok(false) => break,
+                    Err(error) => eprintln!("RustShell: {error}"),
+                }
+            }
+            Err(error) => {
+                eprintln!("Помилка читання консолі: {error}");
+                break;
+            }
+        }
+    }
+}
+
+==============================================================================
+ФАЙЛ: src/parser.rs
+==============================================================================
+use std::fmt;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandSpec {
+    pub program: String,
+    pub args: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseError(pub String);
+
+impl fmt::Display for ParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+impl std::error::Error for ParseError {}
+
+pub fn parse_pipeline(input: &str) -> Result<Vec<CommandSpec>, ParseError> {
+    let mut stages: Vec<Vec<String>> = vec![Vec::new()];
+    let mut token = String::new();
+    let mut quote: Option<char> = None;
+    let mut started = false;
+    let mut chars = input.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        // Backslash escapes whitespace and the pipe operator. Otherwise it is
+        // preserved literally, including Windows path separators and UNC prefixes.
+        if ch == '\\' && quote != Some('\'') {
+            match chars.peek().copied() {
+                Some(next)
+                    if next.is_whitespace()
+                        || next == '|' =>
+                {
+                    token.push(chars.next().expect("peeked character exists"));
+                    started = true;
+                    continue;
+                }
+                _ => {
+                    token.push('\\');
+                    started = true;
+                    continue;
+                }
+            }
+        }
+
+        if let Some(active_quote) = quote {
+            if ch == active_quote {
+                quote = None;
+            } else {
+                token.push(ch);
+            }
+            started = true;
+            continue;
+        }
+
+        match ch {
+            '\'' | '"' => {
+                quote = Some(ch);
+                started = true;
+            }
+            '|' => {
+                if started {
+                    stages
+                        .last_mut()
+                        .expect("stage exists")
+                        .push(std::mem::take(&mut token));
+                    started = false;
+                }
+                if stages.last().expect("stage exists").is_empty() {
+                    return Err(ParseError(
+                        "порожній етап конвеєра перед символом |".into(),
+                    ));
+                }
+                stages.push(Vec::new());
+            }
+            c if c.is_whitespace() => {
+                if started {
+                    stages
+                        .last_mut()
+                        .expect("stage exists")
+                        .push(std::mem::take(&mut token));
+                    started = false;
+                }
+            }
+            _ => {
+                token.push(ch);
+                started = true;
+            }
+        }
+    }
+
+    if quote.is_some() {
+        return Err(ParseError("незакриті лапки у командному рядку".into()));
+    }
+    if started {
+        stages
+            .last_mut()
+            .expect("stage exists")
+            .push(token);
+    }
+    if stages.last().expect("stage exists").is_empty() {
+        return Err(ParseError(
+            "порожня команда або конвеєр завершується символом |".into(),
+        ));
+    }
+
+    stages
+        .into_iter()
+        .map(|mut stage| {
+            if stage.is_empty() {
+                return Err(ParseError("порожній етап конвеєра".into()));
+            }
+            let program = stage.remove(0);
+            if program.is_empty() {
+                return Err(ParseError(
+                    "назва програми не може бути порожньою".into(),
+                ));
+            }
+            Ok(CommandSpec {
+                program,
+                args: stage,
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_basic_command() {
+        let p = parse_pipeline("echo hello world").unwrap();
+        assert_eq!(p[0].program, "echo");
+        assert_eq!(p[0].args, vec!["hello", "world"]);
+    }
+    #[test]
+    fn preserves_spaces_inside_quotes() {
+        let p = parse_pipeline("echo \"hello world\"").unwrap();
+        assert_eq!(p[0].args, vec!["hello world"]);
+    }
+    #[test]
+    fn supports_multiple_pipeline_stages() {
+        let p = parse_pipeline("cat file | grep rust | wc -l").unwrap();
+        assert_eq!(p.len(), 3);
+        assert_eq!(p[2].program, "wc");
+    }
+    #[test]
+    fn rejects_unclosed_quotes() {
+        assert!(parse_pipeline("echo 'abc").is_err());
+    }
+    #[test]
+    fn rejects_empty_stages() {
+        assert!(parse_pipeline("| wc").is_err());
+        assert!(parse_pipeline("echo x || wc").is_err());
+        assert!(parse_pipeline("echo x |").is_err());
+    }
+    #[test]
+    fn keeps_pipe_inside_quotes_as_argument() {
+        let p = parse_pipeline("echo \"a|b\"").unwrap();
+        assert_eq!(p[0].args, vec!["a|b"]);
+    }
+    #[test]
+    fn rejects_empty_program_name() {
+        assert!(parse_pipeline("\"\"").is_err());
+    }
+
+    #[test]
+    fn joins_adjacent_quoted_and_unquoted_parts() {
+        let parsed = parse_pipeline("echo pre\" middle\"post").unwrap();
+        assert_eq!(parsed[0].args, vec!["pre middlepost"]);
+    }
+
+    #[test]
+    fn preserves_backslash_inside_single_quotes() {
+        let parsed = parse_pipeline(r"echo 'a\b'").unwrap();
+        assert_eq!(parsed[0].args, vec![r"a\b"]);
+    }
+
+    #[test]
+    fn accepts_tabs_as_argument_separators() {
+        let parsed = parse_pipeline("echo\tone\ttwo").unwrap();
+        assert_eq!(parsed[0].args, vec!["one", "two"]);
+    }
+
+    #[test]
+    fn rejects_only_whitespace_input() {
+        assert!(parse_pipeline(" \t  ").is_err());
+    }
+
+    #[test]
+    fn preserves_windows_path_separators() {
+        let parsed = parse_pipeline(r#"cd "C:\Users\Student Documents""#).unwrap();
+        assert_eq!(parsed[0].args, vec![r"C:\Users\Student Documents"]);
+    }
+
+    #[test]
+    fn escapes_pipe_inside_unquoted_argument() {
+        let parsed = parse_pipeline(r"echo left\|right").unwrap();
+        assert_eq!(parsed[0].args, vec!["left|right"]);
+    }
+
+    #[test]
+    fn preserves_unc_prefix_and_trailing_separator() {
+        let parsed = parse_pipeline(r#"cd "\\server\share\folder\""#).unwrap();
+        assert_eq!(parsed[0].args, vec![r"\\server\share\folder\"]);
+    }
+}
+
+==============================================================================
+ФАЙЛ: src/pipeline.rs
+==============================================================================
+use crate::parser::CommandSpec;
+use std::io::Read;
+use std::process::{Child, Command, Stdio};
+
+/// Запускає конвеєр і передає stdout останнього процесу безпосередньо в консоль.
+pub fn run(commands: &[CommandSpec]) -> Result<i32, String> {
+    run_internal(commands, false).map(|(status, _)| status)
+}
+
+/// Тестовий/програмний інтерфейс: запускає конвеєр і повертає stdout останнього процесу.
+/// Читання виконується до wait(), щоб не заблокувати процес, який записує великий результат.
+pub fn run_capture(commands: &[CommandSpec]) -> Result<(i32, Vec<u8>), String> {
+    run_internal(commands, true)
+}
+
+fn run_internal(
+    commands: &[CommandSpec],
+    capture_last_stdout: bool,
+) -> Result<(i32, Vec<u8>), String> {
+    if commands.is_empty() {
+        return Err("немає команд для запуску".into());
+    }
+    if commands.iter().any(|spec| spec.program.is_empty()) {
+        return Err("назва програми не може бути порожньою".into());
+    }
+
+    let mut children: Vec<Child> = Vec::with_capacity(commands.len());
+    let mut previous_stdout = None;
+
+    for (index, spec) in commands.iter().enumerate() {
+        let is_last = index + 1 == commands.len();
+        let mut command = Command::new(&spec.program);
+        command.args(&spec.args);
+
+        if let Some(pipe) = previous_stdout.take() {
+            command.stdin(Stdio::from(pipe));
+        } else {
+            command.stdin(Stdio::inherit());
+        }
+
+        if !is_last || capture_last_stdout {
+            command.stdout(Stdio::piped());
+        } else {
+            command.stdout(Stdio::inherit());
+        }
+        command.stderr(Stdio::inherit());
+
+        match command.spawn() {
+            Ok(mut child) => {
+                previous_stdout = if !is_last {
+                    child.stdout.take()
+                } else {
+                    None
+                };
+                children.push(child);
+            }
+            Err(error) => {
+                for child in &mut children {
+                    let _ = child.kill();
+                }
+                for child in &mut children {
+                    let _ = child.wait();
+                }
+                return Err(format!(
+                    "не вдалося запустити програму '{}': {error}",
+                    spec.program
+                ));
+            }
+        }
+    }
+
+    // У режимі capture читаємо останній stdout ДО очікування процесів:
+    // інакше великий обсяг даних може заповнити pipe та спричинити deadlock.
+    let output = if capture_last_stdout {
+        let last = children.last_mut().expect("непорожній список процесів");
+        let Some(mut stdout) = last.stdout.take() else {
+            for child in &mut children {
+                let _ = child.kill();
+            }
+            for child in &mut children {
+                let _ = child.wait();
+            }
+            return Err("не вдалося отримати stdout останнього процесу".into());
+        };
+        let mut bytes = Vec::new();
+        if let Err(error) = stdout.read_to_end(&mut bytes) {
+            for child in &mut children {
+                let _ = child.kill();
+            }
+            for child in &mut children {
+                let _ = child.wait();
+            }
+            return Err(format!("помилка читання stdout конвеєра: {error}"));
+        }
+        bytes
+    } else {
+        Vec::new()
+    };
+
+    let last_index = children.len() - 1;
+    let mut last_status = 1;
+    let mut wait_error: Option<String> = None;
+
+    for (index, child) in children.iter_mut().enumerate() {
+        match child.wait() {
+            Ok(status) if index == last_index => {
+                last_status = status.code().unwrap_or(1);
+            }
+            Ok(_) => {}
+            Err(error) => {
+                if wait_error.is_none() {
+                    wait_error = Some(format!(
+                        "помилка очікування дочірнього процесу: {error}"
+                    ));
+                }
+            }
+        }
+    }
+
+    if let Some(error) = wait_error {
+        Err(error)
+    } else {
+        Ok((last_status, output))
+    }
+}
+
+/// Перевіряє результат конвеєра зручним для тестів способом.
+pub fn run_capture_string(commands: &[CommandSpec]) -> Result<(i32, String), String> {
+    let (status, output) = run_capture(commands)?;
+    let text = String::from_utf8(output)
+        .map_err(|error| format!("stdout не є коректним UTF-8: {error}"))?;
+    Ok((status, text))
+}
+
+==============================================================================
+ФАЙЛ: src/shell.rs
+==============================================================================
+use crate::builtins::{self, Builtin};
+use crate::history::History;
+use crate::logger::Logger;
+use crate::parser::parse_pipeline;
+use crate::pipeline;
+use std::env;
+use std::path::PathBuf;
+
+pub struct Shell {
+    history: History,
+    logger: Logger,
+    last_status: i32,
+}
+
+impl Shell {
+    pub fn new() -> Self {
+        Self::with_log("rustshell.log")
+    }
+
+    pub fn with_log(path: impl Into<String>) -> Self {
+        Self {
+            history: History::new(),
+            logger: Logger::new(path),
+            last_status: 0,
+        }
+    }
+
+    pub fn prompt(&self) -> String {
+        env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("?"))
+            .display()
+            .to_string()
+    }
+
+    /// true — продовжити цикл; false — штатно завершити оболонку.
+    pub fn execute_line(&mut self, line: &str) -> Result<bool, String> {
+        let input = line.trim();
+        if input.is_empty() {
+            return Ok(true);
+        }
+
+        self.history.push(input.to_string());
+        if let Err(error) = self.logger.record(input, "START") {
+            eprintln!(
+                "Попередження: журнал недоступний ({}): {error}",
+                self.logger.path()
+            );
+        }
+
+        let commands = match parse_pipeline(input) {
+            Ok(value) => value,
+            Err(error) => {
+                let _ = self.logger.record(input, "PARSE_ERROR");
+                self.last_status = 2;
+                return Err(error.to_string());
+            }
+        };
+
+        if commands.len() == 1 {
+            match builtins::classify(&commands[0].program, &commands[0].args) {
+                Ok(Some(builtin)) => {
+                    let result = self.run_builtin(builtin);
+                    match result {
+                        Ok(keep_running) => {
+                            let status = 0;
+                            self.last_status = status;
+                            let _ = self.logger.record(input, "BUILTIN_OK");
+                            return Ok(keep_running);
+                        }
+                        Err(error) => {
+                            self.last_status = 1;
+                            let _ = self.logger.record(input, "BUILTIN_ERROR");
+                            return Err(error);
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    self.last_status = 2;
+                    let _ = self.logger.record(input, "BUILTIN_ARGUMENT_ERROR");
+                    return Err(error);
+                }
+            }
+        } else if commands.iter().any(|command| {
+            matches!(
+                command.program.as_str(),
+                "cd" | "pwd" | "help" | "history" | "clear" | "exit" | "quit"
+            )
+        }) {
+            self.last_status = 2;
+            let _ = self.logger.record(input, "BUILTIN_IN_PIPELINE");
+            return Err("вбудовані команди не можна використовувати всередині конвеєра".into());
+        }
+
+        match pipeline::run(&commands) {
+            Ok(status) => {
+                self.last_status = status;
+                let _ = self.logger.record(input, &format!("EXIT_{status}"));
+                Ok(true)
+            }
+            Err(error) => {
+                self.last_status = 127;
+                let _ = self.logger.record(input, "SPAWN_ERROR");
+                Err(error)
+            }
+        }
+    }
+
+    fn run_builtin(&mut self, builtin: Builtin) -> Result<bool, String> {
+        match builtin {
+            Builtin::Help => {
+                println!("RustShell — довідка");
+                println!("  help              довідка");
+                println!("  cd [каталог]      змінити поточний каталог");
+                println!("  pwd               показати поточний каталог");
+                println!("  history           історія поточного сеансу");
+                println!("  clear             очистити екран");
+                println!("  exit / quit       завершити оболонку");
+                println!("  команда1 | команда2 | ...   конвеєр процесів");
+            }
+            Builtin::Cd(path) => {
+                let target = path.ok_or("не задано каталог")?;
+                env::set_current_dir(&target).map_err(|error| {
+                    format!(
+                        "не вдалося перейти до '{}': {error}",
+                        target.display()
+                    )
+                })?;
+            }
+            Builtin::Pwd => {
+                println!(
+                    "{}",
+                    env::current_dir().map_err(|error| error.to_string())?.display()
+                );
+            }
+            Builtin::History => self.history.print(),
+            Builtin::Clear => builtins::clear_screen(),
+            Builtin::Exit => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    pub fn last_status(&self) -> i32 {
+        self.last_status
+    }
+
+    pub fn history_len(&self) -> usize {
+        self.history.len()
+    }
+}
+
+impl Default for Shell {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::Shell;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temporary_log_path() -> String {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir()
+            .join(format!("rustshell-shell-{}-{nonce}.log", std::process::id()))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    #[test]
+    fn exit_command_stops_the_shell_and_is_logged() {
+        let path = temporary_log_path();
+        let mut shell = Shell::with_log(&path);
+        assert!(!shell.execute_line("exit").unwrap());
+        assert_eq!(shell.history_len(), 1);
+        assert_eq!(shell.last_status(), 0);
+
+        let log = fs::read_to_string(&path).unwrap();
+        assert!(log.contains("BUILTIN_OK"));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn parse_error_sets_status_two_and_is_logged() {
+        let path = temporary_log_path();
+        let mut shell = Shell::with_log(&path);
+        assert!(shell.execute_line("echo value |").is_err());
+        assert_eq!(shell.last_status(), 2);
+
+        let log = fs::read_to_string(&path).unwrap();
+        assert!(log.contains("PARSE_ERROR"));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn empty_input_does_not_enter_history() {
+        let path = temporary_log_path();
+        let mut shell = Shell::with_log(&path);
+        assert!(shell.execute_line("   ").unwrap());
+        assert_eq!(shell.history_len(), 0);
+        assert!(!std::path::Path::new(&path).exists());
+    }
+}
+
+==============================================================================
+ФАЙЛ: tests/parser_tests.rs
+==============================================================================
+use rustshell::parser::parse_pipeline;
+
+#[test]
+fn quoted_argument_is_one_token() {
+    let parsed = parse_pipeline("echo \"two words\"").unwrap();
+    assert_eq!(parsed[0].args, vec!["two words"]);
+}
+
+#[test]
+fn three_stage_pipeline_is_parsed() {
+    let parsed = parse_pipeline("cat a | grep b | wc -l").unwrap();
+    assert_eq!(parsed.len(), 3);
+    assert_eq!(parsed[2].program, "wc");
+    assert_eq!(parsed[2].args, vec!["-l"]);
+}
+
+#[test]
+fn malformed_pipeline_is_rejected() {
+    assert!(parse_pipeline("| wc").is_err());
+    assert!(parse_pipeline("a || b").is_err());
+    assert!(parse_pipeline("a |").is_err());
+    assert!(parse_pipeline("a |   | b").is_err());
+}
+
+#[test]
+fn pipe_inside_quotes_is_not_a_separator() {
+    let parsed = parse_pipeline("echo \"left|right\"").unwrap();
+    assert_eq!(parsed.len(), 1);
+    assert_eq!(parsed[0].args, vec!["left|right"]);
+}
+
+#[test]
+fn escaped_whitespace_stays_inside_argument() {
+    let parsed = parse_pipeline(r"echo two\ words").unwrap();
+    assert_eq!(parsed[0].args, vec!["two words"]);
+}
+
+#[test]
+fn empty_quoted_argument_is_preserved() {
+    let parsed = parse_pipeline("echo \"\"").unwrap();
+    assert_eq!(parsed[0].args, vec![""]);
+}
+
+#[test]
+fn unclosed_quotes_are_rejected() {
+    assert!(parse_pipeline("echo 'abc").is_err());
+    assert!(parse_pipeline("echo \"abc").is_err());
+}
+
+#[test]
+fn empty_program_name_is_rejected() {
+    assert!(parse_pipeline("\"\"").is_err());
+}
+
+#[test]
+fn windows_backslashes_are_preserved_in_paths() {
+    let parsed = parse_pipeline(r#"cd "C:\Users\Student Documents""#).unwrap();
+    assert_eq!(parsed[0].args, vec![r"C:\Users\Student Documents"]);
+}
+
+#[test]
+fn trailing_backslash_is_preserved_for_directory_paths() {
+    let parsed = parse_pipeline(r"cd C:\").unwrap();
+    assert_eq!(parsed[0].args, vec![r"C:\"]);
+}
+
+==============================================================================
+ФАЙЛ: tests/pipeline_tests.rs
+==============================================================================
+use rustshell::parser::CommandSpec;
+use rustshell::pipeline::{run_capture_string, run};
+
+fn fixture(args: &[&str]) -> CommandSpec {
+    CommandSpec {
+        program: env!("CARGO_BIN_EXE_pipeline_fixture").to_string(),
+        args: args.iter().map(|value| value.to_string()).collect(),
+    }
+}
+
+#[test]
+fn two_stage_pipeline_transfers_stdout_to_stdin() {
+    let commands = vec![fixture(&["emit", "alpha", "beta"]), fixture(&["upper"])];
+    let (status, output) = run_capture_string(&commands).unwrap();
+    assert_eq!(status, 0);
+    assert_eq!(output, "ALPHA BETA\n");
+}
+
+#[test]
+fn three_stage_pipeline_filters_and_counts_lines() {
+    let commands = vec![
+        fixture(&["emit-lines", "red", "blue", "red"]),
+        fixture(&["filter", "red"]),
+        fixture(&["count"]),
+    ];
+    let (status, output) = run_capture_string(&commands).unwrap();
+    assert_eq!(status, 0);
+    assert_eq!(output, "2\n");
+}
+
+#[test]
+fn large_pipeline_output_is_drained_without_deadlock() {
+    let commands = vec![
+        fixture(&["emit-many", "50000"]),
+        fixture(&["count"]),
+    ];
+    let (status, output) = run_capture_string(&commands).unwrap();
+    assert_eq!(status, 0);
+    assert_eq!(output, "50000\n");
+}
+
+#[test]
+fn last_process_exit_code_is_returned() {
+    let commands = vec![fixture(&["exit", "7"])];
+    let (status, output) = run_capture_string(&commands).unwrap();
+    assert_eq!(status, 7);
+    assert!(output.is_empty());
+}
+
+#[test]
+fn missing_executable_returns_a_descriptive_error() {
+    let commands = vec![CommandSpec {
+        program: "__rustshell_executable_that_does_not_exist__".into(),
+        args: vec![],
+    }];
+    let error = run(&commands).unwrap_err();
+    assert!(error.contains("не вдалося запустити програму"));
+}
+
+#[test]
+fn empty_pipeline_is_rejected() {
+    assert!(run(&[]).is_err());
+}
